@@ -796,7 +796,46 @@
     "iterations": [
       {
         "iteration_id": 1,
-        "method": "Forecast-On-Trajectory (FoT) Scheduler\nA  Two-level cheap forecasting\n   • Every W=32 updates keep a log of (t, ℓ_t, λ̄_t, σ̂²_t) where ℓ_t is the running training loss.\n   • Fit the 3-parameter power law  ℓ̂(t)=a·(t+b)^−α  via one Newton step on the last 150 points – cost O(1).\n   • Closed-form differentiates to give the *marginal improvable loss*  Δℓ̂_T = ℓ̂(t_now)−ℓ̂(T_budget).\nB  Optimal-control LR\n   • Choose the global step size as the largest lr such that the predicted one-step descent from GNT\n        Δℓ_step = lr·g² /(2(σ̂²+λ̄))\n     does not exceed  (Δℓ̂_T)/(T_left) .  Guarantees that the forecasted target is just met at step T.\nC  Phase-aware Fisher gating\n   • Maintain the token-wise Fisher diagonal F_t (already produced by dloss/dlogits).  Define hardness score h_tok = F̄_ans / F̄_prompt .\n   • If h_tok<0.7 (prompt-dominated) multiply lr by 1.5; if >1.3 (answer-dominated) multiply by 0.7.  This automatically warms up faster and cools down earlier when only answer tokens still learn.\nD  Token-difficulty LoRA scaling\n   • For each adapter block compute running RMS of gradient restricted to answer tokens only.  Local lr_i = lr·√(λ̄/λ̄_i,ans) .  Flat blocks that are still useful late therefore keep moving, prompt-only blocks freeze.\nE  Implementation: 80-line torch callback, no extra backward passes, <0.2 % wall time.\n"
+        "method": "Forecast-On-Trajectory (FoT) Scheduler\nA  Two-level cheap forecasting\n   • Every W=32 updates keep a log of (t, ℓ_t, λ̄_t, σ̂²_t) where ℓ_t is the running training loss.\n   • Fit the 3-parameter power law  ℓ̂(t)=a·(t+b)^−α  via one Newton step on the last 150 points – cost O(1).\n   • Closed-form differentiates to give the *marginal improvable loss*  Δℓ̂_T = ℓ̂(t_now)−ℓ̂(T_budget).\nB  Optimal-control LR\n   • Choose the global step size as the largest lr such that the predicted one-step descent from GNT\n        Δℓ_step = lr·g² /(2(σ̂²+λ̄))\n     does not exceed  (Δℓ̂_T)/(T_left) .  Guarantees that the forecasted target is just met at step T.\nC  Phase-aware Fisher gating\n   • Maintain the token-wise Fisher diagonal F_t (already produced by dloss/dlogits).  Define hardness score h_tok = F̄_ans / F̄_prompt .\n   • If h_tok<0.7 (prompt-dominated) multiply lr by 1.5; if >1.3 (answer-dominated) multiply by 0.7.  This automatically warms up faster and cools down earlier when only answer tokens still learn.\nD  Token-difficulty LoRA scaling\n   • For each adapter block compute running RMS of gradient restricted to answer tokens only.  Local lr_i = lr·√(λ̄/λ̄_i,ans) .  Flat blocks that are still useful late therefore keep moving, prompt-only blocks freeze.\nE  Implementation: 80-line torch callback, no extra backward passes, <0.2 % wall time.\n",
+        "experimental_design": {
+          "experiment_summary": "The goal is to verify that the Forecast-On-Trajectory (FoT) learning-rate scheduler yields better GSM8K Pass@1 accuracy than the best prior budget-aware scheduler (BACON) when fine-tuning a small LoRA-adapted Qwen3-0.6B model under strict compute budgets.  Every run is limited to 2 k, 4 k, or 8 k optimiser steps on a single A100-80 GB GPU.  Each step executes standard AdamW backward/optimizer passes; a lightweight PyTorch callback implements FoT without extra gradients.  The callback\n1. Logs loss and curvature/noise surrogates every 32 updates.\n2. Fits a three-parameter power-law on the last 150 points to forecast the attainable final loss given the remaining step budget.\n3. Sets the next global learning-rate so that the expected one-step loss decrease (predicted from gradient-noise theory) does not overshoot the per-step share of the remaining improvable loss, guaranteeing the target loss is met exactly at step T.\n4. Multiplies the step size by a Fisher-based phase gate that distinguishes prompt-dominated from answer-dominated learning phases.\n5. Applies token-difficulty aware LoRA block rescaling so late-stage training focuses on hard answer tokens.\n\nWe train with batch size 64, sequence length 512, LoRA rank = 64, α = 16, and mixed-precision (bf16 + NF4) weights.  Three random seeds are executed for FoT and for the BACON baseline; constant-LR and cosine schedules are run once to confirm previous trends.  Wall-clock time is recorded so that Pass@1 is compared at identical elapsed seconds, not just step counts.\n\nExpected outcome: FoT improves Pass@1 by +5 pp, +3 pp, +1 pp at 2 k, 4 k, 8 k steps respectively while keeping forecast error <3 % and showing zero divergences.  The experiment thereby demonstrates that cheap on-the-fly loss forecasting combined with optimal-control step sizing is superior to purely reactive curvature/noise schedulers.",
+          "evaluation_metrics": [
+            "Pass@1",
+            "Final loss forecast error",
+            "Fraction of steps hitting descent bound",
+            "Number of divergences",
+            "Pass@1 on GSM8K test at equal *wall-clock* budget.  Aux: final loss forecast error |ℓ̂(T)−ℓ_T|, fraction of steps hitting descent bound, #divergences."
+          ],
+          "proposed_method": "Forecast-On-Trajectory (FoT) Scheduler\nA. Two-level cheap forecasting: every W updates store (step t, running loss ℓ_t, mean Hessian eigenvalue λ̄_t via Adam second moment, gradient-noise std σ̂_t).  A three-parameter power law ℓ̂(t)=a·(t+b)^−α is refit by one Newton step on the last 150 samples; complexity is O(1).\nB. Optimal-control learning-rate: compute improvable loss Δℓ̂_T=ℓ̂(t_now)−ℓ̂(T_budget).  Choose the largest lr such that the expected one-step drop from gradient-noise theory Δℓ_step=lr·g² /(2(σ̂²+λ̄)) ≤ Δℓ̂_T/(T_left).  This guarantees that the forecasted target loss will be reached exactly at the final budgeted step.\nC. Phase-aware Fisher gating: derive token-wise Fisher diagonal F from dloss/dlogits.  Define hardness ratio h_tok = mean F on answer tokens divided by mean F on prompt tokens.  If h_tok<0.7 multiply lr by 1.5 (prompt-dominated early phase); if h_tok>1.3 multiply by 0.7 (answer-dominated late phase).\nD. Token-difficulty LoRA scaling: keep a running RMS of gradients limited to answer tokens for every LoRA adapter block.  Scale each block’s local learning-rate by √(λ̄_global / λ̄_block,ans) so blocks that are still useful continue to move while saturated prompt-only blocks freeze.\nE. Implementation: 80 lines of Torch code; invoked as a scheduler callback; <0.2 % overhead in wall-clock time; no additional backward passes.",
+          "comparative_methods": [
+            "BACON Scheduler"
+          ],
+          "models_to_use": [
+            "Qwen3-0.6B"
+          ],
+          "datasets_to_use": [
+            "gsm8k"
+          ],
+          "hyperparameters_to_search": {
+            "lr_init": "1e-4-5e-4",
+            "forecast_window_W": "16,32,64",
+            "adam_beta2": "0.9-0.99"
+          }
+        },
+        "experiment_runs": [
+          {
+            "run_id": "proposed-iter1-Qwen3-0.6B-gsm8k",
+            "method_name": "proposed",
+            "model_name": "Qwen3-0.6B",
+            "dataset_name": "gsm8k"
+          },
+          {
+            "run_id": "comparative-1-iter1-Qwen3-0.6B-gsm8k",
+            "method_name": "comparative-1",
+            "model_name": "Qwen3-0.6B",
+            "dataset_name": "gsm8k"
+          }
+        ]
       }
     ]
   }
