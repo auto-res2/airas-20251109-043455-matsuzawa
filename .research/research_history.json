@@ -793,6 +793,11 @@
       "expected_result": "FoT beats BACON by +1 pp at 8 k, +3 pp at 4 k, +5 pp at 2 k steps; forecast error median <3 %.  No run overshoots budget; wall-clock within ±1 %.  Scheduler selects lr_max automatically (no user knob).",
       "expected_conclusion": "Incorporating a lightweight on-the-fly loss *forecast* and enforcing per-step descent equal to the remaining improvable loss yields a parameter-free, compute-optimal LR schedule.  FoT turns reactive curvature/noise control into a predictive optimiser that finishes exactly on budget, lifts GSM8K accuracy further than BACON/SNAC, and requires no extra FLOPs or hyper-tuning.  The same forecast-control idea is orthogonal to optimiser choice and promises immediate gains for constrained LLM fine-tuning and continual-learning regimes."
     },
-    "iterations": []
+    "iterations": [
+      {
+        "iteration_id": 1,
+        "method": "Forecast-On-Trajectory (FoT) Scheduler\nA  Two-level cheap forecasting\n   • Every W=32 updates keep a log of (t, ℓ_t, λ̄_t, σ̂²_t) where ℓ_t is the running training loss.\n   • Fit the 3-parameter power law  ℓ̂(t)=a·(t+b)^−α  via one Newton step on the last 150 points – cost O(1).\n   • Closed-form differentiates to give the *marginal improvable loss*  Δℓ̂_T = ℓ̂(t_now)−ℓ̂(T_budget).\nB  Optimal-control LR\n   • Choose the global step size as the largest lr such that the predicted one-step descent from GNT\n        Δℓ_step = lr·g² /(2(σ̂²+λ̄))\n     does not exceed  (Δℓ̂_T)/(T_left) .  Guarantees that the forecasted target is just met at step T.\nC  Phase-aware Fisher gating\n   • Maintain the token-wise Fisher diagonal F_t (already produced by dloss/dlogits).  Define hardness score h_tok = F̄_ans / F̄_prompt .\n   • If h_tok<0.7 (prompt-dominated) multiply lr by 1.5; if >1.3 (answer-dominated) multiply by 0.7.  This automatically warms up faster and cools down earlier when only answer tokens still learn.\nD  Token-difficulty LoRA scaling\n   • For each adapter block compute running RMS of gradient restricted to answer tokens only.  Local lr_i = lr·√(λ̄/λ̄_i,ans) .  Flat blocks that are still useful late therefore keep moving, prompt-only blocks freeze.\nE  Implementation: 80-line torch callback, no extra backward passes, <0.2 % wall time.\n"
+      }
+    ]
   }
 }
