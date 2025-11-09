@@ -1,0 +1,414 @@
+
+LLM Name: o3-2025-04-16
+Input:
+You are an AI researcher. You will conduct experiments to demonstrate the superiority of the new method described in # New Methods. Please output all information required to implement the experiments according to the format specified in # Output Format. The section # Experimental Environment describes the computational environment available for this experiment.
+
+# Experimental Environment
+NVIDIA A100 or H200
+VRAM: 80 GB or more
+RAM: 2048 GB or more
+
+# Hypothesis
+open_problems='P1  BACON (and all earlier LR rules) treat the training trajectory as memory-less: they react to the *current* curvature / noise but never use the *history* to predict how much extra loss one can still shave off with the remaining compute.  This makes them blind to (i) fast/slow phases that repeat across runs and (ii) the fact that GSM8K loss follows an almost universal power-law in effective tokens seen.\nP2  A single scalar proxy such as the bulk Hessian or σ² is insufficient: early in training pass@1 is bottlenecked by *instruction recall* (high entropy tokens) whereas late progress stems from polishing *answer tokens*.  These two phases exhibit opposite Fisher information trends that BACON cannot distinguish.\nP3  None of the existing budget-aware schedulers provide a *guaranteed lower bound* on the attainable final loss given the leftover steps – users still have to guess lr_max.\nP4  Current per-block rescaling ignores token–level difficulty: easy arithmetic sub-tasks saturate quickly and begin to overfit while harder ones still need large steps.\n' method='Forecast-On-Trajectory (FoT) Scheduler\nA  Two-level cheap forecasting\n   • Every W=32 updates keep a log of (t, ℓ_t, λ̄_t, σ̂²_t) where ℓ_t is the running training loss.\n   • Fit the 3-parameter power law  ℓ̂(t)=a·(t+b)^−α  via one Newton step on the last 150 points – cost O(1).\n   • Closed-form differentiates to give the *marginal improvable loss*  Δℓ̂_T = ℓ̂(t_now)−ℓ̂(T_budget).\nB  Optimal-control LR\n   • Choose the global step size as the largest lr such that the predicted one-step descent from GNT\n        Δℓ_step = lr·g² /(2(σ̂²+λ̄))\n     does not exceed  (Δℓ̂_T)/(T_left) .  Guarantees that the forecasted target is just met at step T.\nC  Phase-aware Fisher gating\n   • Maintain the token-wise Fisher diagonal F_t (already produced by dloss/dlogits).  Define hardness score h_tok = F̄_ans / F̄_prompt .\n   • If h_tok<0.7 (prompt-dominated) multiply lr by 1.5; if >1.3 (answer-dominated) multiply by 0.7.  This automatically warms up faster and cools down earlier when only answer tokens still learn.\nD  Token-difficulty LoRA scaling\n   • For each adapter block compute running RMS of gradient restricted to answer tokens only.  Local lr_i = lr·√(λ̄/λ̄_i,ans) .  Flat blocks that are still useful late therefore keep moving, prompt-only blocks freeze.\nE  Implementation: 80-line torch callback, no extra backward passes, <0.2\u2009% wall time.\n' experimental_setup='Model   Qwen-3 0.6 B NF4, LoRA r=64 α=16.\nData    GSM8K code-interpreter train 8 k, eval on test.\nBudgets Tested T∈{2 k,4 k,8 k} optimiser steps.\nBaselines Constant-LR, Cosine, SNAC, BACON (best prior).\nFoT hyper-params  lr_init=3e-4,  W=32,  β2=0.95 (inherits AdamW).\nAll runs 3 seeds on 1×A100-80G.\n' primary_metric='Pass@1 on GSM8K test at equal *wall-clock* budget.  Aux: final loss forecast error |ℓ̂(T)−ℓ_T|, fraction of steps hitting descent bound, #divergences.' experimental_code="class FoT(torch.optim.lr_scheduler._LRScheduler):\n    def __init__(self,opt,T,lr_init=3e-4,W=32):\n        self.opt=opt; self.T=T; self.W=W; self.t=0; self.lr=lr_init\n        self.hist=[]  # store last 150 tuples (t,loss,lam,sig)\n    @torch.no_grad()\n    def _stats(self,loss):\n        vs=[p.exp_avg_sq.mean() for g in self.opt.param_groups for p in g['params'] if p.requires_grad]\n        v=torch.stack(vs)\n        lam=v.mean().sqrt(); sig=v.var().sqrt(); return lam.item(),sig.item(),loss.item()\n    def _fit_power(self):\n        if len(self.hist)<10: return None\n        import math, numpy as np\n        ts,ls=zip(*[(h[0],h[1]) for h in self.hist])\n        ts=np.array(ts); ls=np.array(ls)\n        # one Newton step on log-space least squares for a,(b,alpha fixed)\n        Y=np.log(ls); X=np.log(ts+1e-3); A=np.vstack([np.ones_like(X),-X]).T\n        theta=np.linalg.lstsq(A,Y,rcond=None)[0]\n        a=np.exp(theta[0]); alpha=theta[1]; b=1e-3\n        return a,b,alpha\n    def step(self,loss):\n        self.t+=1\n        lam,sig,l= self._stats(loss)\n        self.hist.append((self.t,l,lam,sig)); self.hist=self.hist[-150:]\n        if self.t%self.W: return\n        fit=self._fit_power();\n        if fit is None: return\n        a,b,alpha=fit; tl=self.T-self.t; if tl<=0:return\n        l_now=a*(self.t+b)**(-alpha); l_end=a*(self.T+b)**(-alpha); dL=(l_now-l_end)/tl\n        g2=sum(p.grad.detach().pow(2).mean().item() for g in self.opt.param_groups for p in g['params'] if p.grad is not None)/(1e-9+sum(1 for g in self.opt.param_groups for p in g['params'] if p.grad is not None))\n        lr_bound= dL*2*(sig+lam)/(g2+1e-12)\n        # Fisher gating\n        F_tok=loss.grad_fn.next_functions[0][0].saved_tensors[0].square().mean(dim=-1)\n        h=float(F_tok[-1]/(F_tok[0]+1e-9))\n        scale=1.5 if h<0.7 else (0.7 if h>1.3 else 1)\n        self.lr=min(self.lr*1.1, lr_bound)*scale\n        for g in self.opt.param_groups: g['lr']=self.lr" expected_result='FoT beats BACON by +1 pp at 8 k, +3 pp at 4 k, +5 pp at 2 k steps; forecast error median <3 %.  No run overshoots budget; wall-clock within ±1 %.  Scheduler selects lr_max automatically (no user knob).' expected_conclusion='Incorporating a lightweight on-the-fly loss *forecast* and enforcing per-step descent equal to the remaining improvable loss yields a parameter-free, compute-optimal LR schedule.  FoT turns reactive curvature/noise control into a predictive optimiser that finishes exactly on budget, lifts GSM8K accuracy further than BACON/SNAC, and requires no extra FLOPs or hyper-tuning.  The same forecast-control idea is orthogonal to optimiser choice and promises immediate gains for constrained LLM fine-tuning and continual-learning regimes.'
+
+# Current Research Method
+Forecast-On-Trajectory (FoT) Scheduler
+A  Two-level cheap forecasting
+   • Every W=32 updates keep a log of (t, ℓ_t, λ̄_t, σ̂²_t) where ℓ_t is the running training loss.
+   • Fit the 3-parameter power law  ℓ̂(t)=a·(t+b)^−α  via one Newton step on the last 150 points – cost O(1).
+   • Closed-form differentiates to give the *marginal improvable loss*  Δℓ̂_T = ℓ̂(t_now)−ℓ̂(T_budget).
+B  Optimal-control LR
+   • Choose the global step size as the largest lr such that the predicted one-step descent from GNT
+        Δℓ_step = lr·g² /(2(σ̂²+λ̄))
+     does not exceed  (Δℓ̂_T)/(T_left) .  Guarantees that the forecasted target is just met at step T.
+C  Phase-aware Fisher gating
+   • Maintain the token-wise Fisher diagonal F_t (already produced by dloss/dlogits).  Define hardness score h_tok = F̄_ans / F̄_prompt .
+   • If h_tok<0.7 (prompt-dominated) multiply lr by 1.5; if >1.3 (answer-dominated) multiply by 0.7.  This automatically warms up faster and cools down earlier when only answer tokens still learn.
+D  Token-difficulty LoRA scaling
+   • For each adapter block compute running RMS of gradient restricted to answer tokens only.  Local lr_i = lr·√(λ̄/λ̄_i,ans) .  Flat blocks that are still useful late therefore keep moving, prompt-only blocks freeze.
+E  Implementation: 80-line torch callback, no extra backward passes, <0.2 % wall time.
+
+
+# MODEL LIST
+{
+    "Llama-4-Scout-17B-16E": {
+        "model_parameters": {
+            "total_parameters": "109b",
+            "active_parameters": "17b"
+        },
+        "model_architecture": "Transformer-based Mixture-of-Experts (MoE) architecture",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text",
+            "image"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [],
+        "code": "",
+        "citation": ""
+    },
+    "Llama-4-Maverick-17B-128E": {
+        "model_parameters": {
+            "total_parameters": "400b",
+            "active_parameters": "17b"
+        },
+        "model_architecture": "Transformer-based Mixture-of-Experts (MoE) architecture",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text",
+            "image"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [],
+        "code": "",
+        "citation": ""
+    },
+    "Qwen3-0.6B": {
+        "model_parameters": "0.6b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/Qwen/Qwen3-0.6B",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers>=4.51.0"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\nmodel_name = \"Qwen/Qwen3-0.6B\"\n\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_name,\ntorch_dtype=\"auto\",\ndevice_map=\"auto\"\n)\n\nprompt = \"Give me a short introduction to large language model.\"\nmessages = [\n{\"role\": \"user\", \"content\": prompt}\n]\ntext = tokenizer.apply_chat_template(\nmessages,\ntokenize=False,\nadd_generation_prompt=True,\nenable_thinking=True # Switches between thinking and non-thinking modes. Default is True.\n)\nmodel_inputs = tokenizer([text], return_tensors=\"pt\").to(model.device)\n\ngenerated_ids = model.generate(\n**model_inputs,\nmax_new_tokens=32768\n)\noutput_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()",
+        "citation": "@misc{qwen3technicalreport,\n    title={Qwen3 Technical Report},\n    author={Qwen Team},\n    year={2025},\n    eprint={2505.09388},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2505.09388},\n}"
+    },
+    "Qwen3-1.7B": {
+        "model_parameters": "1.7b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/Qwen/Qwen3-1.7B",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers>=4.51.0"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\nmodel_name = \"Qwen/Qwen3-1.7B\"\n\n# load the tokenizer and the model\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_name,\ntorch_dtype=\"auto\",\ndevice_map=\"auto\"\n)\n\n# prepare the model input\nprompt = \"Give me a short introduction to large language model.\"\nmessages = [\n{\"role\": \"user\", \"content\": prompt}\n]\ntext = tokenizer.apply_chat_template(\nmessages,\ntokenize=False,\nadd_generation_prompt=True,\nenable_thinking=True # Switches between thinking and non-thinking modes. Default is True.\n)\nmodel_inputs = tokenizer([text], return_tensors=\"pt\").to(model.device)\n\n# conduct text completion\ngenerated_ids = model.generate(\n**model_inputs,\nmax_new_tokens=32768\n)\noutput_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()",
+        "citation": "@misc{qwen3technicalreport,\n    title={Qwen3 Technical Report},\n    author={Qwen Team},\n    year={2025},\n    eprint={2505.09388},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2505.09388},\n}"
+    },
+    "Qwen3-4B": {
+        "model_parameters": "4b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/Qwen/Qwen3-4B",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers>=4.51.0"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\n\nmodel_name = \"Qwen/Qwen3-4B\"\n\n# load the tokenizer and the model\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_name,\ntorch_dtype=\"auto\",\ndevice_map=\"auto\"\n)\n\n# prepare the model input\nprompt = \"Give me a short introduction to large language model.\"\nmessages = [\n{\"role\": \"user\", \"content\": prompt}\n]\ntext = tokenizer.apply_chat_template(\nmessages,\ntokenize=False,\nadd_generation_prompt=True,\nenable_thinking=True # Switches between thinking and non-thinking modes. Default is True.\n)\nmodel_inputs = tokenizer([text], return_tensors=\"pt\").to(model.device)\n\n# conduct text completion\ngenerated_ids = model.generate(\n**model_inputs,\nmax_new_tokens=32768\n)\noutput_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()",
+        "citation": "@misc{qwen3technicalreport,\n    title={Qwen3 Technical Report},\n    author={Qwen Team},\n    year={2025},\n    eprint={2505.09388},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2505.09388},\n}"
+    },
+    "Qwen3-8B": {
+        "model_parameters": "8b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/Qwen/Qwen3-8B",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers>=4.51.0"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\nmodel_name = \"Qwen/Qwen3-8B\"\n\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_name,\ntorch_dtype=\"auto\",\ndevice_map=\"auto\"\n)\n\nprompt = \"Give me a short introduction to large language model.\"\nmessages = [\n{\"role\": \"user\", \"content\": prompt}\n]\ntext = tokenizer.apply_chat_template(\nmessages,\ntokenize=False,\nadd_generation_prompt=True,\nenable_thinking=True # Switches between thinking and non-thinking modes. Default is True.\n)\nmodel_inputs = tokenizer([text], return_tensors=\"pt\").to(model.device)\n\ngenerated_ids = model.generate(\n**model_inputs,\nmax_new_tokens=32768\n)\noutput_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()",
+        "citation": "@misc{qwen3technicalreport,\n    title={Qwen3 Technical Report},\n    author={Qwen Team},\n    year={2025},\n    eprint={2505.09388},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2505.09388},\n}"
+    },
+    "Qwen3-14B": {
+        "model_parameters": "14b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/Qwen/Qwen3-14B",
+        "language_distribution": "",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers>=4.51.0"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\n\nmodel_name = \"Qwen/Qwen3-14B\"\n\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_name,\ntorch_dtype=\"auto\",\ndevice_map=\"auto\"\n)\n\nprompt = \"Give me a short introduction to large language model.\"\nmessages = [\n{\"role\": \"user\", \"content\": prompt}\n]\ntext = tokenizer.apply_chat_template(\nmessages,\ntokenize=False,\nadd_generation_prompt=True,\nenable_thinking=True # Switches between thinking and non-thinking modes. Default is True.\n)\nmodel_inputs = tokenizer([text], return_tensors=\"pt\").to(model.device)\n\ngenerated_ids = model.generate(\n**model_inputs,\nmax_new_tokens=32768\n)\noutput_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()",
+        "citation": "@misc{qwen3technicalreport,\n    title={Qwen3 Technical Report},\n    author={Qwen Team},\n    year={2025},\n    eprint={2505.09388},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2505.09388},\n}"
+    },
+    "Qwen3-32B": {
+        "model_parameters": "32.8b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/Qwen/Qwen3-32B",
+        "language_distribution": "",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers>=4.51.0"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\n\nmodel_name = \"Qwen/Qwen3-32B\"\n\n# load the tokenizer and the model\ntokenizer = AutoTokenizer.from_pretrained(model_name)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_name,\ntorch_dtype=\"auto\",\ndevice_map=\"auto\"\n)\n\n# prepare the model input\nprompt = \"Give me a short introduction to large language model.\"\nmessages = [\n{\"role\": \"user\", \"content\": prompt}\n]\ntext = tokenizer.apply_chat_template(\nmessages,\ntokenize=False,\nadd_generation_prompt=True,\nenable_thinking=True # Switches between thinking and non-thinking modes. Default is True.\n)\nmodel_inputs = tokenizer([text], return_tensors=\"pt\").to(model.device)\n\n# conduct text completion\ngenerated_ids = model.generate(\n**model_inputs,\nmax_new_tokens=32768\n)\noutput_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()",
+        "citation": "@misc{qwen3technicalreport,\n    title={Qwen3 Technical Report},\n    author={Qwen Team},\n    year={2025},\n    eprint={2505.09388},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2505.09388},\n}"
+    },
+    "DeepSeek-v3": {
+        "model_parameters": {
+            "total_parameters": "671b",
+            "active_parameters": "37b"
+        },
+        "model_architecture": "Transformer-based Mixture-of-Experts (MoE) architecture",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/deepseek-ai/DeepSeek-V3",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [],
+        "code": "",
+        "citation": "@misc{deepseekai2024deepseekv3technicalreport,\n    title={DeepSeek-V3 Technical Report},\n    author={DeepSeek-AI},\n    year={2024},\n    eprint={2412.19437},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2412.19437},\n}"
+    },
+    "DeepSeek-V3.1": {
+        "model_parameters": {
+            "total_parameters": "671B",
+            "active_parameters": "37B"
+        },
+        "model_architecture": "Transformer-based Mixture-of-Experts (MoE) architecture",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.1",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "Text"
+        ],
+        "output_modalities": [
+            "Text"
+        ],
+        "dependent packages": [],
+        "code": "",
+        "citation": "@misc{deepseekai2024deepseekv3technicalreport,\n    title={DeepSeek-V3 Technical Report},\n    author={DeepSeek-AI},\n    year={2024},\n    eprint={2412.19437},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2412.19437},\n}"
+    },
+    "DeepSeek-V3.2-Exp": {
+        "model_parameters": {
+            "total_parameters": "671B",
+            "active_parameters": "37B"
+        },
+        "model_architecture": "Transformer-based Mixture-of-Experts (MoE) architecture",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "Text"
+        ],
+        "output_modalities": [
+            "Text"
+        ],
+        "dependent packages": [],
+        "code": "",
+        "citation": "@misc{deepseekai2024deepseekv32,\n    title={DeepSeek-V3.2-Exp: Boosting Long-Context Efficiency with DeepSeek Sparse Attention},\n    author={DeepSeek-AI},\n    year={2025},\n}"
+    },
+    "gpt-oss-20b": {
+        "model_parameters": {
+            "total_parameters": "21b",
+            "active_parameters": "3.6b"
+        },
+        "model_architecture": "Transformer-based Mixture-of-Experts (MoE) architecture",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/openai/gpt-oss-20b",
+        "context_length": "",
+        "language_distribution": "multilingual",
+        "input_modalities": "text",
+        "output_modalities": "text",
+        "dependent packages": [
+            "accelerate",
+            "transformers",
+            "kernels"
+        ],
+        "code": "from transformers import AutoModelForCausalLM, AutoTokenizer\nmodel_id = \"openai/gpt-oss-20b\"\ntokenizer = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForCausalLM.from_pretrained(\nmodel_id,\ndevice_map=\"auto\",\ntorch_dtype=\"auto\",\n)\nmessages = [\n{\"role\": \"user\", \"content\": \"How many rs are in the word 'strawberry'?\"},\n]\n\ninputs = tokenizer.apply_chat_template(\nmessages,\nadd_generation_prompt=True,\nreturn_tensors=\"pt\",\nreturn_dict=True,\n).to(model.device)\n\ngenerated = model.generate(**inputs, max_new_tokens=100)\nprint(tokenizer.decode(generated[0][inputs[\"input_ids\"].shape[-1]:]))\n",
+        "citation": "@misc{openai2025gptoss120bgptoss20bmodel,\n    title={gpt-oss-120b & gpt-oss-20b Model Card},\n    author={OpenAI},\n    year={2025},\n    eprint={2508.10925},\n    archivePrefix={arXiv},\n    primaryClass={cs.CL},\n    url={https://arxiv.org/abs/2508.10925},\n}"
+    },
+    "gemma-3-1b-it": {
+        "model_parameters": "1b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/google/gemma-3-1b-it",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text",
+            "image"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers"
+        ],
+        "code": "from transformers import AutoTokenizer, AutoModelForCausalLM\n\ntokenizer = AutoTokenizer.from_pretrained(\"google/gemma-3-1b-it\")\nmodel = AutoModelForCausalLM.from_pretrained(\"google/gemma-3-1b-it\")\nmessages = [\n{\"role\": \"user\", \"content\": \"自己紹介してください\"},\n]\ninputs = tokenizer.apply_chat_template(\nmessages,\nadd_generation_prompt=True,\ntokenize=True,\nreturn_dict=True,\nreturn_tensors=\"pt\",\n).to(model.device)\n\noutputs = model.generate(**inputs, max_new_tokens=4000)\nprint(tokenizer.decode(outputs[0][inputs[\"input_ids\"].shape[-1]:]))\n",
+        "citation": "@article{gemma_2025,\ntitle={Gemma 3},\nurl={https://goo.gle/Gemma3Report},\npublisher={Kaggle},\nauthor={Gemma Team},\nyear={2025}\n}"
+    },
+    "gemma-3-4b-it": {
+        "model_parameters": "4b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/google/gemma-3-4b-it",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text",
+            "image"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers"
+        ],
+        "code": "from transformers import AutoTokenizer, AutoModelForCausalLM\n\ntokenizer = AutoTokenizer.from_pretrained(\"google/gemma-3-4b-it\")\nmodel = AutoModelForCausalLM.from_pretrained(\"google/gemma-3-4b-it\")\nmessages = [\n{\"role\": \"user\", \"content\": \"自己紹介してください\"},\n]\ninputs = tokenizer.apply_chat_template(\nmessages,\nadd_generation_prompt=True,\ntokenize=True,\nreturn_dict=True,\nreturn_tensors=\"pt\",\n).to(model.device)\n\noutputs = model.generate(**inputs, max_new_tokens=4000)\nprint(tokenizer.decode(outputs[0][inputs[\"input_ids\"].shape[-1]:]))\n",
+        "citation": "@article{gemma_2025,\ntitle={Gemma 3},\nurl={https://goo.gle/Gemma3Report},\npublisher={Kaggle},\nauthor={Gemma Team},\nyear={2025}\n}"
+    },
+    "gemma-3-27b-it": {
+        "model_parameters": "27b",
+        "model_architecture": "Transformer",
+        "training_data_sources": "",
+        "huggingface_url": "https://huggingface.co/google/gemma-3-27b-it",
+        "language_distribution": "Multilingual",
+        "input_modalities": [
+            "text",
+            "image"
+        ],
+        "output_modalities": [
+            "text"
+        ],
+        "dependent packages": [
+            "transformers"
+        ],
+        "code": "from transformers import AutoTokenizer, AutoModelForCausalLM\n\ntokenizer = AutoTokenizer.from_pretrained(\"google/gemma-3-27b-it\")\nmodel = AutoModelForCausalLM.from_pretrained(\"google/gemma-3-27b-it\")\nmessages = [\n{\"role\": \"user\", \"content\": \"自己紹介してください\"},\n]\ninputs = tokenizer.apply_chat_template(\nmessages,\nadd_generation_prompt=True,\ntokenize=True,\nreturn_dict=True,\nreturn_tensors=\"pt\",\n).to(model.device)\n\noutputs = model.generate(**inputs, max_new_tokens=4000)\nprint(tokenizer.decode(outputs[0][inputs[\"input_ids\"].shape[-1]:]))\n",
+        "citation": "@article{gemma_2025,\ntitle={Gemma 3},\nurl={https://goo.gle/Gemma3Report},\npublisher={Kaggle},\nauthor={Gemma Team},\nyear={2025}\n}"
+    }
+}
+
+# DATASET LIST
+{
+    "alpaca-cleaned": {
+        "discription": "",
+        "num_training_samples": "",
+        "num_validation_samples": "",
+        "huggingface_url": "https://huggingface.co/datasets/yahma/alpaca-cleaned",
+        "language_distribution": "",
+        "dependent packages": [],
+        "code": "",
+        "citation": ""
+    },
+    "databricks-dolly-15k": "",
+    "gsm8k": {
+        "discription": "A dataset of elementary school math word problems requiring 2 to 8 steps to solve",
+        "num_training_samples": 7473,
+        "num_validation_samples": 1319,
+        "huggingface_url": "https://huggingface.co/datasets/openai/gsm8k",
+        "language_distribution": "English",
+        "dependent packages": [],
+        "code": "",
+        "citation": "@article{cobbe2021gsm8k,\ntitle={Training Verifiers to Solve Math Word Problems},\nauthor={Cobbe, Karl and Kosaraju, Vineet and Bavarian, Mohammad and Chen, Mark and Jun, Heewoo and Kaiser, Lukasz and Plappert, Matthias and Tworek, Jerry and Hilton, Jacob and Nakano, Reiichiro and Hesse, Christopher and Schulman, John},\njournal={arXiv preprint arXiv:2110.14168},\nyear={2021}\n}"
+    },
+    "MATH": {
+        "discription": "The MATH dataset consists of approximately 12,500 mathematics problems ranging from middle school to early university level. Each problem includes a natural language question, a detailed step-by-step solution, and a final answer, and it is widely used to evaluate large language models (LLMs) in terms of their abilities in mathematical reasoning, logical inference, and step-by-step problem solving.",
+        "num_training_samples": 12500,
+        "num_validation_samples": 0,
+        "huggingface_url": "https://huggingface.co/datasets/qwedsacf/competition_math",
+        "language_distribution": "English",
+        "dependent packages": [],
+        "code": "",
+        "example": "{'problem': 'A board game spinner is divided into three parts labeled $A$, $B$  and $C$. The probability of the spinner landing on $A$ is $\\frac{1}{3}$ and the probability of the spinner landing on $B$ is $\\frac{5}{12}$.  What is the probability of the spinner landing on $C$? Express your answer as a common fraction.',\n'level': 'Level 1',\n'type': 'Counting & Probability',\n'solution': 'The spinner is guaranteed to land on exactly one of the three regions, so we know that the sum of the probabilities of it landing in each region will be 1. If we let the probability of it landing in region $C$ be $x$, we then have the equation $1 = \\frac{5}{12}+\\frac{1}{3}+x$, from which we have $x=\\boxed{\\frac{1}{4}}$.'}",
+        "data_structure": "A data instance consists of a competition math problem and its step-by-step solution written in LaTeX and natural language. The step-by-step solution contains the final answer enclosed in LaTeX's \boxed tag.\n- problem: The competition math problem.\n- solution: The step-by-step solution.\n- level: The problem's difficulty level from 'Level 1' to 'Level 5', where a subject's easiest problems for humans are assigned to 'Level 1' and a subject's hardest problems are assigned to 'Level 5'.\n- type: The subject of the problem: Algebra, Counting & Probability, Geometry, Intermediate Algebra, Number Theory, Prealgebra and Precalculus.",
+        "citation": "@article{hendrycksmath2021,\ntitle={Measuring Mathematical Problem Solving With the MATH Dataset},\nauthor={Dan Hendrycks\nand Collin Burns\nand Saurav Kadavath\nand Akul Arora\nand Steven Basart\nand Eric Tang\nand Dawn Song\nand Jacob Steinhardt},\njournal={arXiv preprint arXiv:2103.03874},\nyear={2021}\n}"
+    }
+}
+
+# Output Format
+- experiment_summary：
+  - Describe the overall implementation details of the experiment. Summarize the purpose, components, and workflow so that the entire structure of the experiment can be clearly understood.
+- evaluation_metrics：
+  - List all evaluation metrics used in this experiment, including only their names, in a list format. (e.g., Accuracy AUC ROC, F1 Score, RMSE, BLEU, ROUGE, etc.)
+  - The primary metric specified in the hypothesis (Pass@1 on GSM8K test at equal *wall-clock* budget.  Aux: final loss forecast error |ℓ̂(T)−ℓ_T|, fraction of steps hitting descent bound, #divergences.) MUST be included in this list.
+- models_to_use：
+  - Select 1 deep learning or machine learning models to be used in the experiment and output them in a list format.
+  - Each model name should clearly indicate its number of parameters.
+  - Refer to the provided “# MODEL LIST” for guidance, although models not included in the list are also acceptable.
+  - If the proposed method itself introduces a new model (e.g., a novel architecture), return an empty list and describe the details of the method in new_method.
+- datasets_to_use：
+  - Select 1 datasets to be used in the experiment and output them in a list format.
+  - Refer to the provided “# DATASET LIST” for guidance, although datasets not included in the list are also acceptable.
+  - If a new dataset is proposed as part of this study, return an empty list and describe its details in new_method.
+- proposed_method：
+  - Describe the proposed method and its implementation in detail.
+  - Clearly state its objectives, theoretical background, components, and algorithmic procedures.
+- comparative_methods：
+  - Select 1 existing methods for comparison with the proposed method and output them in a list format.
+  - For example, if the proposed method is a new optimization algorithm, comparative methods might include Adam or AdamW.
+  - If the proposal is a new LLM architecture, comparative methods might include Llama 4 or Qwen.
+- hyperparameters_to_search：
+  - Output a list of objects, where each object contains "name" (hyperparameter name) and "range" (search range).
+  - For example: [{"name": "learning_rate", "range": "0.001-0.01"}, {"name": "batch_size", "range": "16,32,64"}, {"name": "weight_decay", "range": "0.0001-0.001"}]
+  - Search ranges can be expressed as ranges (e.g., "0.001-0.01") or discrete values (e.g., "16,32,64").
+Output:
+{
+    "experiment_summary": "The goal is to verify that the Forecast-On-Trajectory (FoT) learning-rate scheduler yields better GSM8K Pass@1 accuracy than the best prior budget-aware scheduler (BACON) when fine-tuning a small LoRA-adapted Qwen3-0.6B model under strict compute budgets.  Every run is limited to 2 k, 4 k, or 8 k optimiser steps on a single A100-80 GB GPU.  Each step executes standard AdamW backward/optimizer passes; a lightweight PyTorch callback implements FoT without extra gradients.  The callback\n1. Logs loss and curvature/noise surrogates every 32 updates.\n2. Fits a three-parameter power-law on the last 150 points to forecast the attainable final loss given the remaining step budget.\n3. Sets the next global learning-rate so that the expected one-step loss decrease (predicted from gradient-noise theory) does not overshoot the per-step share of the remaining improvable loss, guaranteeing the target loss is met exactly at step T.\n4. Multiplies the step size by a Fisher-based phase gate that distinguishes prompt-dominated from answer-dominated learning phases.\n5. Applies token-difficulty aware LoRA block rescaling so late-stage training focuses on hard answer tokens.\n\nWe train with batch size 64, sequence length 512, LoRA rank = 64, α = 16, and mixed-precision (bf16 + NF4) weights.  Three random seeds are executed for FoT and for the BACON baseline; constant-LR and cosine schedules are run once to confirm previous trends.  Wall-clock time is recorded so that Pass@1 is compared at identical elapsed seconds, not just step counts.\n\nExpected outcome: FoT improves Pass@1 by +5 pp, +3 pp, +1 pp at 2 k, 4 k, 8 k steps respectively while keeping forecast error <3 % and showing zero divergences.  The experiment thereby demonstrates that cheap on-the-fly loss forecasting combined with optimal-control step sizing is superior to purely reactive curvature/noise schedulers.",
+    "evaluation_metrics": [
+        "Pass@1",
+        "Final loss forecast error",
+        "Fraction of steps hitting descent bound",
+        "Number of divergences"
+    ],
+    "models_to_use": [
+        "Qwen3-0.6B"
+    ],
+    "datasets_to_use": [
+        "gsm8k"
+    ],
+    "proposed_method": "Forecast-On-Trajectory (FoT) Scheduler\nA. Two-level cheap forecasting: every W updates store (step t, running loss ℓ_t, mean Hessian eigenvalue λ̄_t via Adam second moment, gradient-noise std σ̂_t).  A three-parameter power law ℓ̂(t)=a·(t+b)^−α is refit by one Newton step on the last 150 samples; complexity is O(1).\nB. Optimal-control learning-rate: compute improvable loss Δℓ̂_T=ℓ̂(t_now)−ℓ̂(T_budget).  Choose the largest lr such that the expected one-step drop from gradient-noise theory Δℓ_step=lr·g² /(2(σ̂²+λ̄)) ≤ Δℓ̂_T/(T_left).  This guarantees that the forecasted target loss will be reached exactly at the final budgeted step.\nC. Phase-aware Fisher gating: derive token-wise Fisher diagonal F from dloss/dlogits.  Define hardness ratio h_tok = mean F on answer tokens divided by mean F on prompt tokens.  If h_tok<0.7 multiply lr by 1.5 (prompt-dominated early phase); if h_tok>1.3 multiply by 0.7 (answer-dominated late phase).\nD. Token-difficulty LoRA scaling: keep a running RMS of gradients limited to answer tokens for every LoRA adapter block.  Scale each block’s local learning-rate by √(λ̄_global / λ̄_block,ans) so blocks that are still useful continue to move while saturated prompt-only blocks freeze.\nE. Implementation: 80 lines of Torch code; invoked as a scheduler callback; <0.2 % overhead in wall-clock time; no additional backward passes.",
+    "comparative_methods": [
+        "BACON Scheduler"
+    ],
+    "hyperparameters_to_search": [
+        {
+            "name": "lr_init",
+            "range": "1e-4-5e-4"
+        },
+        {
+            "name": "forecast_window_W",
+            "range": "16,32,64"
+        },
+        {
+            "name": "adam_beta2",
+            "range": "0.9-0.99"
+        }
+    ]
+}
